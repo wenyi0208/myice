@@ -1,0 +1,22 @@
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Large generated datasets and model outputs
+data/
+data_bak/
+numpy/
+predictions/
+log/
+
+# Local agent/tooling state
+.agents/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
