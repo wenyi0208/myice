@@ -55,7 +55,7 @@ def main():
 
     source_start_year = 1958
     val_start_year = 1979
-    val_end_year = 2020
+    val_end_year = 2025
     target_time_steps = (val_end_year - val_start_year + 1) * 12
     start_idx = (val_start_year - source_start_year) * 12
 
@@ -66,7 +66,26 @@ def main():
         data_var = ds[var["var_name"]]
         arr = np.squeeze(data_var.values)
 
-        arr = np.nan_to_num(arr, nan=0.0)
+        # 新拼接的 ORAS5 uo/vo 文件中，部分缺测格点仍以
+        # 9.96921e36 等 NetCDF 填充值存在，而不是 NaN。若直接参与
+        # 标准化会造成数值溢出，并使模型从 2019-01 起输出 NaN。
+        if var["var_name"] in {"uo", "vo"}:
+            invalid = (~np.isfinite(arr)) | (np.abs(arr) > 1e4)
+            invalid_count = int(invalid.sum())
+            if invalid_count > 0:
+                print(
+                    f"清理 {var['source_dir']}/{var['filename']}: "
+                    f"{invalid_count} 个 uo/vo 缺测或异常填充值"
+                )
+                arr[invalid] = 0.0
+
+        # 所有变量统一清除仍然存在的 NaN 和正负无穷，避免无穷值被
+        # np.nan_to_num 默认替换为浮点最大值。
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # 与 gen_train.py 保持相同的海冰厚度异常值处理。
+        if var["var_name"] == "sithick":
+            arr[arr > 50] = 0.0
 
         end_idx = start_idx + target_time_steps
         if arr.shape[0] < end_idx:

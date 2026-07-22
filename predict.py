@@ -164,8 +164,8 @@ def create_netcdf(predictions: np.ndarray, start_year: int, start_month: int, ou
 
 def main():
     parser = argparse.ArgumentParser(description='Swin Transformer 预测')
-    parser.add_argument('--start-time', type=str, default='2015-01', help='起始时间 YYYY-MM')
-    parser.add_argument('--end-time', type=str, default='2018-12', help='结束时间 YYYY-MM')
+    parser.add_argument('--start-time', type=str, default='1979-12', help='起始时间 YYYY-MM')
+    parser.add_argument('--end-time', type=str, default='2025-12', help='结束时间 YYYY-MM')
     parser.add_argument(
         '--val-start-time',
         type=str,
