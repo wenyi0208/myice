@@ -49,7 +49,13 @@ def main():
         "uo_10.nc", 
         "vo_0.nc",
         "vo_10.nc",
-        "zg_5000.nc"
+        "zg_925.nc",
+        "zg_850.nc",
+        "zg_500.nc",
+        "zg_300.nc",
+        "zg_100.nc",
+        "zg_50.nc",
+        "zg_10.nc"
     ]
     out_dir.mkdir(parents=True, exist_ok=True)
 

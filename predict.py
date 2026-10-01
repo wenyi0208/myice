@@ -9,7 +9,23 @@ import torch.nn as nn
 import xarray as xr
 from datetime import datetime
 
-from model_geo import model as create_model
+from model_grouped import model as create_model
+
+# Must match dataset.ZG_LEVELS and the hPa-based zg filenames used by the
+# data-generation scripts: zg_925.nc ... zg_10.nc.
+ZG_LEVELS = (925, 850, 500, 300, 100, 50, 10)
+INPUT_VAR_KEYS = [
+    "siconc",
+    "sithick",
+    "tas",
+    "uo0",
+    "uo10",
+    "vo0",
+    "vo10",
+    *(f"zg{level}" for level in ZG_LEVELS),
+]
+SAMPLE_CHANNELS = len(INPUT_VAR_KEYS) + 1
+LANDMASK_CHANNEL_IDX = len(INPUT_VAR_KEYS)
 
 # 显存优化
 torch.backends.cudnn.benchmark = True
@@ -42,7 +58,7 @@ def from_month_index(idx: int, start_year: int = 1979, start_month: int = 1) -> 
 class PreDataset:
     """预测用数据集 - 直接加载任意时间范围的输入数据"""
 
-    VAR_KEYS = ["siconc", "sithick", "tas", "uo0", "uo10", "vo0", "vo10", "zg5000"]
+    VAR_KEYS = INPUT_VAR_KEYS
 
     def __init__(
         self,
@@ -52,6 +68,17 @@ class PreDataset:
         stats_ds_name: str | None = None
     ):
         self.arr = np.load(val_numpy_path)
+        if self.arr.ndim != 4:
+            raise ValueError(
+                f"{val_numpy_path} must have shape [variable, time, H, W], "
+                f"got {self.arr.shape}"
+            )
+        if self.arr.shape[0] != len(self.VAR_KEYS):
+            raise ValueError(
+                f"{val_numpy_path} has {self.arr.shape[0]} variable channels, "
+                f"but this model expects {len(self.VAR_KEYS)}: {self.VAR_KEYS}. "
+                "Regenerate val.npy with gen_val.py."
+            )
         self.T, self.H, self.W = self.arr.shape[1], self.arr.shape[2], self.arr.shape[3]
         
         # 加载标准化参数
@@ -63,7 +90,6 @@ class PreDataset:
         climate_data = np.load(climate_path, allow_pickle=True).item()
         available = list(climate_data.keys())
         if stats_ds_name is None:
-            # 默认取第一个（保持向后兼容）。如果存在多个数据集，建议显式指定，避免拿错统计量。
             if len(available) > 1:
                 print(f"警告: climate.npy 包含多个数据集 {available}，默认使用第一个: {available[0]}")
             self.ds_name = available[0]
@@ -75,20 +101,35 @@ class PreDataset:
         if self.ds_name not in self.normalize:
             raise KeyError(f"normalize.json 中不存在数据集 {self.ds_name}，候选: {list(self.normalize.keys())}")
         self.climate = {k: v for k, v in climate_data[self.ds_name].items()}
+        missing_climate = [
+            key for key in self.VAR_KEYS[1:] if key not in self.climate
+        ]
+        missing_normalize = [
+            key
+            for key in self.VAR_KEYS[1:]
+            if key not in self.normalize[self.ds_name]
+        ]
+        if missing_climate or missing_normalize:
+            raise ValueError(
+                "Training statistics do not cover every input variable. "
+                f"Missing climate keys: {missing_climate}; "
+                f"missing normalization keys: {missing_normalize}. "
+                "Regenerate training NumPy data with gen_val.py/gen_train.py, then "
+                "rebuild climate.npy and normalize.json."
+            )
         
         # 加载 landmask
         self.landmask = np.load(train_data_dir.parent / "landmask.npy")
 
     def get_input(self, start_idx: int) -> np.ndarray:
-        """获取输入样本 [9, 6, H, W]"""
-        # 防止负索引/越界导致静默取错月份（Python 负索引会从数组尾部取值）
+        """获取输入样本 [C, 6, H, W]"""
         if start_idx < 0 or (start_idx + 6) > self.T:
             raise IndexError(
                 f"start_idx 越界: {start_idx}, 需要满足 0 <= start_idx <= {self.T - 6} "
                 f"(因为输入窗口长度为 6，数据总长度 T={self.T})"
             )
         H, W = self.H, self.W
-        sample = np.zeros((9, 6, H, W), dtype=np.float32)
+        sample = np.zeros((SAMPLE_CHANNELS, 6, H, W), dtype=np.float32)
         
         start_mod = start_idx % 12
         month_indices = (np.arange(6) + start_mod) % 12
@@ -110,7 +151,7 @@ class PreDataset:
             sample[vidx] = normalized
         
         # landmask
-        sample[8] = self.landmask.astype(np.float32)
+        sample[LANDMASK_CHANNEL_IDX] = self.landmask.astype(np.float32)
         
         return np.nan_to_num(sample, nan=0.0)
 
@@ -199,8 +240,8 @@ def main():
     print(f"设备: {device}")
     
     # 加载模型
-    model = create_model(in_chans=9).to(device)
     checkpoint = torch.load(args.model_path, map_location=device)
+    model = create_model(in_chans=SAMPLE_CHANNELS).to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
     print(f"模型已加载 (epoch {checkpoint.get('epoch', 'N/A')})")
     
@@ -215,14 +256,13 @@ def main():
     land_mask = (dataset.landmask == 1)
     print(f"数据: {dataset.T} 个月, H={H}, W={W}")
     
-    # 计算输入窗口索引范围（窗口长度=6，输出 lead=1..6；为了覆盖 [start_time, end_time] 的所有 lead）
-    # 注意：这里的 month_index 是相对于 val.npy 的起点 (val_start_time) 的月份索引。
+    # 计算输入窗口索引范围
     start_input_idx = to_month_index(start_year, start_month, start_year=val0_year, start_month=val0_month) - 11
     end_input_idx = to_month_index(end_year, end_month, start_year=val0_year, start_month=val0_month) - 6
     num_windows = end_input_idx - start_input_idx + 1
     print(f"输入窗口: {num_windows} 个 (索引 {start_input_idx} ~ {end_input_idx})")
 
-    # 边界检查：避免负索引/越界导致取错数据（尤其是 start_time < val_start_time 时会静默错）
+    # 边界检查
     if num_windows <= 0:
         raise ValueError(f"预测时间范围非法: start={args.start_time}, end={args.end_time}")
     if start_input_idx < 0:
@@ -245,7 +285,7 @@ def main():
     
     # 批量预测
     all_outputs = predict_batch(model, batch_inputs, device, batch_size=12)
-    all_outputs = np.where(land_mask, np.nan, all_outputs)  # 应用海陆掩码
+    all_outputs = np.where(land_mask, np.nan, all_outputs)
 
     print(f"批量预测完成, 形状: {all_outputs.shape}")
     

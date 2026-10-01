@@ -684,7 +684,7 @@ class SwinTransformer(nn.Module):
         return x
 
 def model(**kwargs):
-    in_chans = kwargs.pop('in_chans', 9)
+    in_chans = kwargs.pop('in_chans', 15)
     model = SwinTransformer(in_chans=in_chans,
                            patch_size=(1, 2, 2),
                            stride=(1, 2, 2),

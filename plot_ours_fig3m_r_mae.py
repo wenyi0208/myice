@@ -187,7 +187,8 @@ def compute_lead_mae_fields(args) -> dict:
         gt_ds.close()
 
 
-def add_grid_labels(ax, data_proj: ccrs.CRS) -> None:
+def add_grid_labels(ax, data_proj: ccrs.CRS, show_left_label: bool, show_right_label: bool) -> None:
+    """Use the compact longitude/latitude label layout of the reference panel."""
     gl = ax.gridlines(
         crs=data_proj,
         draw_labels=True,
@@ -197,12 +198,16 @@ def add_grid_labels(ax, data_proj: ccrs.CRS) -> None:
     )
     gl.top_labels = True
     gl.bottom_labels = True
-    gl.left_labels = True
-    gl.right_labels = True
-    gl.xlabel_style = {"size": 7, "weight": "bold"}
-    gl.ylabel_style = {"size": 7, "weight": "bold"}
+    # Keep 50°N only on the outer edges, as in the reference figure.
+    gl.left_labels = show_left_label
+    gl.right_labels = show_right_label
+    gl.xlabel_style = {"size": 5.4, "family": "serif", "weight": "bold"}
+    gl.ylabel_style = {"size": 5.4, "family": "serif", "weight": "bold"}
     gl.x_inline = False
     gl.y_inline = False
+    gl.rotate_labels = False
+    gl.xpadding = 1.0
+    gl.ypadding = 1.0
 
 
 def panel_label(index: int, start: str) -> str:
@@ -236,7 +241,11 @@ def plot(args) -> Path:
     gs = gridspec.GridSpec(2, ncols, height_ratios=[1.0, 0.26])
     gs.update(left=0.035, right=0.985, top=0.82, bottom=0.20, wspace=0.08, hspace=0.02)
 
-    map_proj = ccrs.NorthPolarStereo(central_longitude=args.central_longitude)
+    # Rotate the content of every polar-map panel 90 degrees clockwise while
+    # keeping titles, panel letters, ``ours`` and the colorbar horizontal.
+    # For NorthPolarStereo, increasing central_longitude by 90° produces this
+    # clockwise in-panel rotation for both MAE fields and coastlines.
+    map_proj = ccrs.NorthPolarStereo(central_longitude=args.central_longitude + 90.0)
     data_proj = ccrs.PlateCarree()
 
     last_mesh = None
@@ -246,6 +255,8 @@ def plot(args) -> Path:
         ax.set_aspect("equal")
         ax.set_facecolor(args.background_color)
         ax.tick_params(which="both", bottom=False, left=False, labelbottom=False, labelleft=False)
+        ax.spines["geo"].set_linewidth(0.55)
+        ax.spines["geo"].set_edgecolor("0.45")
 
         last_mesh = ax.pcolormesh(
             lon2d,
@@ -277,7 +288,12 @@ def plot(args) -> Path:
                 transform=data_proj,
             )
 
-        add_grid_labels(ax, data_proj)
+        add_grid_labels(
+            ax,
+            data_proj,
+            show_left_label=(col == 0),
+            show_right_label=(col == ncols - 1),
+        )
         ax.set_title(f"Lead month={lead}", pad=12)
         ax.text(
             0.02,
@@ -328,18 +344,18 @@ def main() -> None:
     )
     parser.add_argument(
         "--pred-file",
-        default="predictions/200001_201812_20260709_012615_TTT.nc",
+        default="predictions_v5_history12/198006_202512_20260817_185510_v5_history12.nc",
         help="Prediction NetCDF with dimensions time, leadtime, lat, lon.",
     )
-    parser.add_argument("--gt-file", default="data/oras5/siconc.nc", help="Observation NetCDF file.")
+    parser.add_argument("--gt-file", default="../myice/data/oras5/siconc.nc", help="Observation NetCDF file.")
     parser.add_argument("--landmask", default="numpy/landmask.npy", help="Land mask .npy file where 1 means land.")
     parser.add_argument("--pred-var", default="siconc", help="Prediction variable name.")
     parser.add_argument("--gt-var", default="siconc", help="Observation variable name.")
     parser.add_argument("--lead-dim", default="leadtime", help="Lead-time coordinate variable name.")
     parser.add_argument("--leads", default="1,2,3,4,5,6", help="Comma-separated leads, or 'all'.")
     parser.add_argument("--target-month", type=int, default=9, help="Target month to average, 9 for September.")
-    parser.add_argument("--start-year", type=int, default=None, help="Optional first target year.")
-    parser.add_argument("--end-year", type=int, default=None, help="Optional last target year.")
+    parser.add_argument("--start-year", type=int, default=2000, help="Optional first target year.")
+    parser.add_argument("--end-year", type=int, default=2019, help="Optional last target year.")
     parser.add_argument("--model-name", default="ours", help="Row label shown at lower left.")
     parser.add_argument("--panel-start", default="m", help="First panel letter, default mimics Fig. 3m-r.")
     parser.add_argument("--min-lat", type=float, default=50.0, help="Southern latitude limit.")
@@ -356,7 +372,7 @@ def main() -> None:
     parser.add_argument("--coastline-width", type=float, default=0.35, help="Land-mask coastline width.")
     parser.add_argument("--colorbar-height-scale", type=float, default=0.42, help="Relative height of the MAE colorbar.")
     parser.add_argument("--output-dir", default="figures", help="Output directory.")
-    parser.add_argument("--output-name", default="ours_fig3m_r_mae", help="Output filename stem.")
+    parser.add_argument("--output-name", default="ours_fig3m_r_mae_v5_stable", help="Output filename stem.")
     parser.add_argument("--dpi", type=int, default=300, help="Figure DPI.")
     args = parser.parse_args()
 

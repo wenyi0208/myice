@@ -78,22 +78,75 @@ def _autocast(device: torch.device, enabled: bool):
     return contextlib.nullcontext()
 
 
+def _unpack_batch(batch):
+    if len(batch) != 3:
+        raise ValueError(
+            "Expected dataset batch (inputs, targets, month_idx). "
+            "The current Dataset returns a single 15-channel input tensor; "
+            "update older training loops that unpack (surface, zg, targets, month_idx)."
+        )
+    return batch
+
+
+def _check_finite(name: str, tensor: torch.Tensor, phase: str, step=None, batch_idx=None) -> None:
+    with torch.no_grad():
+        finite_mask = torch.isfinite(tensor)
+        if bool(finite_mask.all()):
+            return
+
+        nonfinite = int((~finite_mask).sum().item())
+        total = tensor.numel()
+        where = f"phase={phase}"
+        if step is not None:
+            where += f", step={step}"
+        if batch_idx is not None:
+            where += f", batch={batch_idx}"
+
+        finite_values = tensor.detach()[finite_mask].float()
+        if finite_values.numel() > 0:
+            min_val = float(finite_values.min().item())
+            max_val = float(finite_values.max().item())
+            mean_val = float(finite_values.mean().item())
+            stats = f"finite min={min_val:.6g}, max={max_val:.6g}, mean={mean_val:.6g}"
+        else:
+            stats = "no finite values"
+
+    raise FloatingPointError(
+        f"Non-finite tensor detected in {name} ({where}): "
+        f"{nonfinite}/{total} values are NaN/Inf; {stats}."
+    )
+
+
+def _check_finite_loss(name: str, value: torch.Tensor, phase: str, step=None, batch_idx=None) -> None:
+    if torch.isfinite(value).item():
+        return
+    raise FloatingPointError(
+        f"Non-finite {name} detected (phase={phase}, step={step}, batch={batch_idx}): "
+        f"{float(value.detach().item())}."
+    )
+
+
 def evaluate_full_val(
     model: nn.Module,
     val_loader: DataLoader,
     device: torch.device,
     amp: bool = False,
-) -> float:
+ ) -> float:
     model.eval()
     val_losses = []
     with torch.no_grad():
-        for val_inputs, val_targets, val_month_idx in val_loader:
+        for batch_idx, batch in enumerate(val_loader):
+            val_inputs, val_targets, val_month_idx = _unpack_batch(batch)
             val_inputs = val_inputs.to(device, non_blocking=True)
             val_targets = val_targets.to(device, non_blocking=True)
             val_month_idx = val_month_idx.to(device, non_blocking=True)
+            _check_finite("val inputs", val_inputs, "val_epoch", batch_idx=batch_idx)
+            _check_finite("val targets", val_targets, "val_epoch", batch_idx=batch_idx)
             with _autocast(device, amp):
                 val_outputs = model(val_inputs)
+                _check_finite("val outputs", val_outputs, "val_epoch", batch_idx=batch_idx)
                 val_loss = loss(val_inputs, val_outputs, val_targets, val_month_idx)
+            _check_finite_loss("val loss", val_loss, "val_epoch", batch_idx=batch_idx)
             val_losses.append(val_loss.item())
     return sum(val_losses) / len(val_losses) if val_losses else 0.0
 
@@ -119,7 +172,8 @@ def train_and_eval_one_epoch(
     train_losses = []
     val_loss = None
 
-    for batch_idx, (inputs, targets, month_idx) in enumerate(train_loader):
+    for batch_idx, batch in enumerate(train_loader):
+        inputs, targets, month_idx = _unpack_batch(batch)
         inputs = inputs.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         month_idx = month_idx.to(device, non_blocking=True)
@@ -163,19 +217,23 @@ def train_and_eval_one_epoch(
         if val_interval > 0 and (batch_idx + 1) % val_interval == 0:
             model.eval()
             try:
-                val_inputs, val_targets, val_month_idx = next(val_iter)
+                val_inputs, val_targets, val_month_idx = _unpack_batch(next(val_iter))
             except StopIteration:
                 val_iter = iter(val_loader)
-                val_inputs, val_targets, val_month_idx = next(val_iter)
+                val_inputs, val_targets, val_month_idx = _unpack_batch(next(val_iter))
 
             val_inputs = val_inputs.to(device, non_blocking=True)
             val_targets = val_targets.to(device, non_blocking=True)
             val_month_idx = val_month_idx.to(device, non_blocking=True)
+            _check_finite("val inputs", val_inputs, "val_step", step=current_step)
+            _check_finite("val targets", val_targets, "val_step", step=current_step)
 
             with torch.no_grad():
                 with _autocast(device, amp):
                     val_outputs = model(val_inputs)
+                    _check_finite("val outputs", val_outputs, "val_step", step=current_step)
                     val_loss = loss(val_inputs, val_outputs, val_targets, val_month_idx)
+                _check_finite_loss("val loss", val_loss, "val_step", step=current_step)
                 tb_writer.add_scalar("loss/val", val_loss.item(), current_step)
 
         if val_loss is not None:
@@ -223,14 +281,16 @@ def get_dataloader(
     data_dir: str,
     batch_size: int = 8,
     shuffle: bool = False,
+    num_workers: int = 0,
+    pin_memory: bool = True,
 ):
     dataset = TrainDataset(numpy_dir=Path(data_dir))
     return DataLoader(
         dataset=dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=0,
-        pin_memory=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
     )
 
 
@@ -238,12 +298,14 @@ def get_val_dataloader(
     val_data_dir: str,
     batch_size: int = 8,
     shuffle: bool = False,
+    num_workers: int = 0,
+    pin_memory: bool = True,
 ):
     dataset = ValDataset(val_numpy_path=Path(val_data_dir))
     return DataLoader(
         dataset=dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=0,
-        pin_memory=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
     )

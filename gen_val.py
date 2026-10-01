@@ -5,11 +5,98 @@ import numpy as np
 import xarray as xr
 
 
+FILL_VALUE_LIMIT = 1e20
+
+
+def clean_array(arr: np.ndarray, file_path: Path) -> np.ndarray:
+    arr = np.asarray(arr, dtype=np.float32)
+    bad = (~np.isfinite(arr)) | (np.abs(arr) > FILL_VALUE_LIMIT)
+    if np.any(bad):
+        print(f"Warning: replace {int(bad.sum())} invalid/fill values in {file_path}")
+        arr = arr.copy()
+        arr[bad] = 0.0
+    return arr
+
+
+def validate_time_range(
+    time_coord: xr.DataArray,
+    file_path: Path,
+    start_year: int,
+    end_year: int,
+) -> None:
+    expected_months = (end_year - start_year + 1) * 12
+    actual_months = time_coord.size
+    expected_codes = np.arange(
+        start_year * 12 + 1,
+        end_year * 12 + 13,
+    )
+    actual_codes = (
+        np.asarray(time_coord.dt.year.values, dtype=np.int64) * 12
+        + np.asarray(time_coord.dt.month.values, dtype=np.int64)
+    )
+
+    if actual_months != expected_months or not np.array_equal(
+        actual_codes, expected_codes
+    ):
+        raise ValueError(
+            f"{file_path} does not cover every month from "
+            f"{start_year}-01 through {end_year}-12: "
+            f"found {actual_months}, expected {expected_months}."
+        )
+
+
+def select_validation_period(
+    data_var: xr.DataArray,
+    file_path: Path,
+    var_name: str,
+    start_year: int,
+    end_year: int,
+) -> np.ndarray:
+    expected_months = (end_year - start_year + 1) * 12
+    start_date = f"{start_year}-01-01"
+    end_date = f"{end_year}-12-31"
+
+    time_coord_name = None
+    for candidate in ("time", "time_counter"):
+        if candidate in data_var.coords:
+            time_coord_name = candidate
+            break
+
+    if time_coord_name is not None:
+        selected = data_var.sel({time_coord_name: slice(start_date, end_date)})
+        validate_time_range(
+            selected[time_coord_name],
+            file_path,
+            start_year,
+            end_year,
+        )
+        return np.squeeze(selected.values)
+
+    arr = np.squeeze(data_var.values)
+    if arr.ndim < 3:
+        raise ValueError(
+            f"{file_path} variable {var_name} has unexpected shape: {arr.shape}"
+        )
+    if arr.shape[0] != expected_months:
+        raise ValueError(
+            f"{file_path} variable {var_name} has no time/time_counter "
+            f"coordinate, and its first dimension is {arr.shape[0]}, "
+            f"not the expected {expected_months} months."
+        )
+    print(
+        f"Warning: {file_path} variable {var_name} has no time/time_counter "
+        f"coordinate; treating the first dimension as {start_year}-01 "
+        f"through {end_year}-12."
+    )
+    return arr
+
+
 def main():
     out_dir = Path("./numpy/val")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # VAR_KEYS = ["siconc", "sithick", "tas", "uo0", "uo10", "vo0", "vo10", "zg5000"]
+    # Channel order must agree with dataset.VAR_KEYS: zg925, zg850, zg500,
+    # zg300, zg100, zg50, zg10. The NetCDF filenames use the same hPa labels.
     variables = [
         {
             "source_dir": "oras5",
@@ -48,52 +135,57 @@ def main():
         },
         {
             "source_dir": "era5",
-            "filename": "zg_5000.nc",
+            "filename": "zg_925.nc",
+            "var_name": "zg",
+        },
+        {
+            "source_dir": "era5",
+            "filename": "zg_850.nc",
+            "var_name": "zg",
+        },
+        {
+            "source_dir": "era5",
+            "filename": "zg_500.nc",
+            "var_name": "zg",
+        },
+        {
+            "source_dir": "era5",
+            "filename": "zg_300.nc",
+            "var_name": "zg",
+        },
+        {
+            "source_dir": "era5",
+            "filename": "zg_100.nc",
+            "var_name": "zg",
+        },
+        {
+            "source_dir": "era5",
+            "filename": "zg_50.nc",
+            "var_name": "zg",
+        },
+        {
+            "source_dir": "era5",
+            "filename": "zg_10.nc",
             "var_name": "zg",
         },
     ]
 
-    source_start_year = 1958
     val_start_year = 1979
     val_end_year = 2025
-    target_time_steps = (val_end_year - val_start_year + 1) * 12
-    start_idx = (val_start_year - source_start_year) * 12
 
     arrs = []
     for var in variables:
         file_path = Path("./data") / var["source_dir"] / var["filename"]
         ds = xr.open_dataset(file_path)
         data_var = ds[var["var_name"]]
-        arr = np.squeeze(data_var.values)
-
-        # 新拼接的 ORAS5 uo/vo 文件中，部分缺测格点仍以
-        # 9.96921e36 等 NetCDF 填充值存在，而不是 NaN。若直接参与
-        # 标准化会造成数值溢出，并使模型从 2019-01 起输出 NaN。
-        if var["var_name"] in {"uo", "vo"}:
-            invalid = (~np.isfinite(arr)) | (np.abs(arr) > 1e4)
-            invalid_count = int(invalid.sum())
-            if invalid_count > 0:
-                print(
-                    f"清理 {var['source_dir']}/{var['filename']}: "
-                    f"{invalid_count} 个 uo/vo 缺测或异常填充值"
-                )
-                arr[invalid] = 0.0
-
-        # 所有变量统一清除仍然存在的 NaN 和正负无穷，避免无穷值被
-        # np.nan_to_num 默认替换为浮点最大值。
-        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # 与 gen_train.py 保持相同的海冰厚度异常值处理。
-        if var["var_name"] == "sithick":
-            arr[arr > 50] = 0.0
-
-        end_idx = start_idx + target_time_steps
-        if arr.shape[0] < end_idx:
-            raise ValueError(
-                f"{file_path} 时间长度不足: 需要至少 {end_idx} 个月 "
-                f"({val_start_year}-01 到 {val_end_year}-12), 实际 {arr.shape[0]} 个月"
-            )
-        arr = arr[start_idx:end_idx, :, :]
+        arr = select_validation_period(
+            data_var,
+            file_path,
+            var["var_name"],
+            val_start_year,
+            val_end_year,
+        )
+        arr = clean_array(arr, file_path)
 
         if var["var_name"] == "siconc":
             if np.nanmax(arr) > 1.5:
@@ -102,9 +194,12 @@ def main():
 
         if var["var_name"] == "zg":
             arr = arr / 9.8
+            arr = clean_array(arr, file_path)
 
-        print(f"读取 {var['source_dir']}/{var['filename']} ({var['var_name']}) "
-              f"形状: {arr.shape}")
+        print(
+            f"读取 {var['source_dir']}/{var['filename']} ({var['var_name']}) "
+            f"形状: {arr.shape}, 月数: {arr.shape[0]}"
+        )
 
         arrs.append(arr)
         ds.close()
@@ -115,6 +210,7 @@ def main():
     out_path = out_dir / "val.npy"
     np.save(out_path, stacked, allow_pickle=False)
     print(f"\n已保存验证集到 {out_path},形状 {stacked.shape}")
+
 
 if __name__ == "__main__":
     main()

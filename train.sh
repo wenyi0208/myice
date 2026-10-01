@@ -1,39 +1,71 @@
 #!/bin/bash
-# ===================================================
-# GPU计算作业示例 - 深度学习训练
-# 适用队列：qgpu_3090, qgpu_4090, qgpu_a800
-# ===================================================
+#SBATCH -p 5090
+#SBATCH -N 1
+#SBATCH -n 1
+#SBATCH -c 8
+#SBATCH --gres=gpu:1
+#SBATCH --exclude=node-5090-2
+#SBATCH -J gpu_icetraining
+#SBATCH -o gpu_%j.out
+#SBATCH -e gpu_%j.err
+#SBATCH --mem=128G
+#SBATCH --time=48:00:00
 
-#SBATCH --job-name=gpu_training
-#SBATCH --output=gpu_%j.out
-#SBATCH --error=gpu_%j.err
+set -euo pipefail
 
-# GPU资源配置
-#SBATCH --partition=qgpu_3090       # GPU分区选择
-#SBATCH --nodes=1                   # GPU作业通常单节点
-#SBATCH --ntasks-per-node=1         # 单任务运行
-#SBATCH --cpus-per-task=4           # CPU核心数（建议2-4核/GPU）
-#SBATCH --gres=gpu:1                # GPU卡数量（1-4卡）
-#SBATCH --mem=128G                   # 内存大小（建议16-64GB）
-#SBATCH --time=36:00:00             # 最大运行时间
+echo "========== GPU job started =========="
+echo "Job ID: ${SLURM_JOB_ID:-N/A}"
+echo "Node: $(hostname)"
+echo "Start time: $(date)"
+echo "SLURM_JOB_GPUS before export: ${SLURM_JOB_GPUS:-unset}"
+echo "CUDA_VISIBLE_DEVICES before export: ${CUDA_VISIBLE_DEVICES:-unset}"
 
-# 通知设置
-#SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=932238083@qq.com
+if [ -z "${CUDA_VISIBLE_DEVICES:-}" ] && [ -n "${SLURM_JOB_GPUS:-}" ]; then
+    export CUDA_VISIBLE_DEVICES="${SLURM_JOB_GPUS}"
+fi
+export PYTORCH_NVML_BASED_CUDA_CHECK=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
 
-# 环境初始化
-echo "========== GPU作业开始 =========="
-echo "作业ID: $SLURM_JOB_ID"
-echo "GPU节点: $(hostname)"
-echo "开始时间: $(date)"
+echo "SLURM_JOB_GPUS after export: ${SLURM_JOB_GPUS:-unset}"
+echo "CUDA_VISIBLE_DEVICES after export: ${CUDA_VISIBLE_DEVICES:-unset}"
+echo "PYTORCH_NVML_BASED_CUDA_CHECK: ${PYTORCH_NVML_BASED_CUDA_CHECK}"
+echo "OMP_NUM_THREADS: ${OMP_NUM_THREADS}"
+echo "MKL_NUM_THREADS: ${MKL_NUM_THREADS}"
+echo "---------- NVIDIA device files ----------"
+ls -l /dev/nvidia* || true
+echo "-----------------------------------------"
 
-# 检查GPU状态
-nvidia-smi
-echo "GPU驱动信息已显示"
+echo "---------- NVIDIA driver info ----------"
+cat /proc/driver/nvidia/version || true
+nvidia-smi -L || true
+echo "----------------------------------------"
 
-# 执行GPU计算任务
-echo "开始执行深度学习训练..."
-python -u train_TTT_5.py
+echo "---------- GPU device info ----------"
+nvidia-smi || true
+echo "-------------------------------------"
 
-echo "========== GPU作业完成 =========="
-echo "结束时间: $(date)"
+python - <<'PY'
+import sys
+import torch
+
+print("torch:", torch.__version__)
+print("torch.version.cuda:", torch.version.cuda)
+print("torch.cuda.is_available():", torch.cuda.is_available())
+print("torch.cuda.device_count():", torch.cuda.device_count())
+if torch.cuda.device_count() < 1:
+    sys.exit("No CUDA devices are visible to PyTorch.")
+try:
+    print("torch.cuda.get_device_name(0):", torch.cuda.get_device_name(0))
+    x = torch.empty(1, device="cuda")
+    print("CUDA tensor test:", x.device)
+except Exception as exc:
+    print("CUDA runtime test failed:", repr(exc))
+    sys.exit(1)
+PY
+
+echo "Starting training..."
+python -u train_TTT_5.py --device cuda --num-workers 0
+
+echo "========== GPU job finished =========="
+echo "End time: $(date)"

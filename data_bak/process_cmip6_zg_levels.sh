@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Extract and regrid six CMIP6 atmospheric geopotential-height levels.
+# Extract and regrid seven CMIP6 atmospheric geopotential-height levels.
 #
 # Default usage from any directory:
 #   bash /fs6/home/daihaijin4/data/myice/data_bak/process_cmip6_zg_levels.sh
@@ -57,16 +57,17 @@ declare -A MODEL_GRID=(
     ["TaiESM1"]="gn"
 )
 
-LEVELS=("92500" "85000" "30000" "10000" "5000" "1000")
+LEVELS=("92500" "85000" "50000" "30000" "10000" "5000" "1000")
 OUTPUT_NAMES=(
-    "zg_9250.nc"
-    "zg_8500.nc"
-    "zg_3000.nc"
-    "zg_1000.nc"
+    "zg_925.nc"
+    "zg_850.nc"
     "zg_500.nc"
+    "zg_300.nc"
     "zg_100.nc"
+    "zg_50.nc"
+    "zg_10.nc"
 )
-LEVEL_CSV="92500,85000,30000,10000,5000,1000"
+LEVEL_CSV="92500,85000,50000,30000,10000,5000,1000"
 
 EXPECTED_FIRST_MONTH="185001"
 EXPECTED_LAST_MONTH="201412"

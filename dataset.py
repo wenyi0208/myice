@@ -9,13 +9,36 @@ from torch.utils.data import Dataset
 from numba import njit, prange
 
 # 常量定义
+# Geopotential-height files now use hPa in their filenames, e.g. zg_925.nc.
+# Keep this channel order identical to gen_train.py and gen_val.py.
+ZG_LEVELS = (925, 850, 500, 300, 100, 50, 10)
+VAR_KEYS = (
+    "siconc",
+    "sithick",
+    "tas",
+    "uo0",
+    "uo10",
+    "vo0",
+    "vo10",
+    *(f"zg{level}" for level in ZG_LEVELS),
+)
 MONTHS_PER_YEAR = 12
 CLIMATE_COMPUTATION_YEARS = 35  # 用于计算气候态的年数（420个月 = 35年）
 CLIMATE_TIME_STEPS = CLIMATE_COMPUTATION_YEARS * MONTHS_PER_YEAR  # 420
-SAMPLE_CHANNELS = 9  # 样本通道数（8个变量 + 1个landmask）
-LANDMASK_CHANNEL_IDX = 8  # landmask在sample中的通道索引
+SAMPLE_CHANNELS = len(VAR_KEYS) + 1  # variables + landmask
+LANDMASK_CHANNEL_IDX = len(VAR_KEYS)
 SICONC_VAR_IDX = 0  # siconc变量在VAR_KEYS中的索引
 EPSILON = 1e-8  # 用于避免除零的小常数
+FILL_VALUE_LIMIT = 1e20
+
+
+def _sanitize_array(arr: np.ndarray, fill_value_limit: float = FILL_VALUE_LIMIT) -> np.ndarray:
+    arr = np.asarray(arr, dtype=np.float32)
+    bad = (~np.isfinite(arr)) | (np.abs(arr) > fill_value_limit)
+    if np.any(bad):
+        arr = arr.copy()
+        arr[bad] = 0.0
+    return arr
 
 
 @njit(parallel=True)
@@ -80,7 +103,15 @@ def _normalize(
     Returns:
         标准化后的数组，形状为 (T, H, W)
     """
-    return _normalize_jit(var_slice, np.array(clim), mean, std, start_mod)
+    if not np.isfinite(mean):
+        mean = 0.0
+    if not np.isfinite(std) or abs(std) <= EPSILON:
+        return np.zeros_like(var_slice, dtype=np.float32)
+
+    var_slice = _sanitize_array(var_slice)
+    clim = _sanitize_array(np.array(clim, dtype=np.float32))
+    normalized = _normalize_jit(var_slice, clim, float(mean), float(std), start_mod)
+    return _sanitize_array(normalized)
 
 
 def _compute_climate(arr: np.ndarray, var_keys: List[str]) -> Dict[str, List]:
@@ -94,8 +125,9 @@ def _compute_climate(arr: np.ndarray, var_keys: List[str]) -> Dict[str, List]:
 
         for month in range(MONTHS_PER_YEAR):
             #  直接用整个时间序列
-            month_data = arr[var_idx][month::MONTHS_PER_YEAR, ...]
+            month_data = _sanitize_array(arr[var_idx][month::MONTHS_PER_YEAR, ...])
             monthly_mean = np.nanmean(month_data, axis=0)
+            monthly_mean = _sanitize_array(monthly_mean)
 
             monthly_climates.append(monthly_mean.tolist())
 
@@ -129,7 +161,7 @@ class BaseDataset(Dataset):
     - 准备训练样本和标签
     """
     # 变量名称列表，按数据数组中的顺序排列
-    VAR_KEYS = ["siconc", "sithick", "tas", "uo0", "uo10", "vo0", "vo10", "zg5000"]
+    VAR_KEYS = list(VAR_KEYS)
     
     # 窗口大小配置
     INPUT_LEN = 6  # 输入时间步数
@@ -213,6 +245,33 @@ class BaseDataset(Dataset):
             return _load_json(normalize_path)
         return None
 
+    def _has_required_stats(self, stats: Optional[Dict]) -> bool:
+        if not stats or "cmip6_mean" not in stats:
+            return False
+        return all(
+            key in stats["cmip6_mean"]
+            for key in self.VAR_KEYS
+            if key != "siconc"
+        )
+
+    def _validate_array_channels(self, path: Path) -> int:
+        arr = np.load(path, mmap_mode="r", allow_pickle=False)
+        try:
+            if arr.ndim != 4:
+                raise ValueError(
+                    f"{path} must have shape [variable, time, H, W], got {arr.shape}"
+                )
+            expected = len(self.VAR_KEYS)
+            if arr.shape[0] != expected:
+                raise ValueError(
+                    f"{path} has {arr.shape[0]} variable channels, but the current "
+                    f"configuration expects {expected}: {self.VAR_KEYS}. "
+                    "Regenerate the NumPy data with gen_train.py or gen_val.py."
+                )
+            return int(arr.shape[1])
+        finally:
+            del arr
+
     def _prepare_sample(
         self,
         arr: np.ndarray,
@@ -258,8 +317,8 @@ class BaseDataset(Dataset):
         self._add_landmask(sample, height, width)
 
         # 处理 NaN 值
-        sample = np.nan_to_num(sample, nan=0.0)
-        label = np.nan_to_num(label, nan=0.0)
+        sample = _sanitize_array(sample)
+        label = _sanitize_array(label)
         
         return sample, label, label_start_month
 
@@ -279,7 +338,7 @@ class BaseDataset(Dataset):
             sample: 样本数组（将被修改）
             label: 标签数组（将被修改）
         """
-        siconc_window = arr[SICONC_VAR_IDX, start:start + self.window_size]
+        siconc_window = _sanitize_array(arr[SICONC_VAR_IDX, start:start + self.window_size])
         sample[SICONC_VAR_IDX] = siconc_window[:self.input_len]
         label[0] = siconc_window[self.input_len:]
 
@@ -306,7 +365,7 @@ class BaseDataset(Dataset):
                 continue
             
             # 提取变量时间窗口
-            var_window = arr[var_idx, start:start + self.window_size]
+            var_window = _sanitize_array(arr[var_idx, start:start + self.window_size])
             
             # 获取该变量的气候态和标准化参数
             climate = self.climate["cmip6_mean"][var_key]
@@ -323,8 +382,9 @@ class BaseDataset(Dataset):
             
             # 缩放到 [-1, 1]（如果 max_val 足够大）
             max_val = norm_params["max"]
-            if max_val > EPSILON:
+            if np.isfinite(max_val) and max_val > EPSILON:
                 normalized = normalized / max_val
+            normalized = _sanitize_array(normalized)
             
             # 只取输入部分（前 input_len 个时间步）
             sample[var_idx] = normalized[:self.input_len]
@@ -375,13 +435,17 @@ class TrainDataset(BaseDataset):
         # 加载所有数据集文件
         self.dataset_files = sorted(numpy_dir.glob("*.npy"))
         self.dataset_names = [path.stem for path in self.dataset_files]
+        if not self.dataset_files:
+            raise ValueError(f"No training npy files found in {numpy_dir}")
+        for path in self.dataset_files:
+            self._validate_array_channels(path)
 
         # 如果气候态数据不存在，就计算并保存它
-        if self.climate is None:
+        if not self._has_required_stats(self.climate):
             self._compute_and_save_climate(climate_path) # 生成 climate.npy
 
         # 计算或加载标准化参数
-        if self.normalize is None:
+        if not self._has_required_stats(self.normalize):
             self._compute_and_save_normalize_params(normalize_path)
 
         # 计算数据集大小
@@ -444,16 +508,16 @@ class TrainDataset(BaseDataset):
                     continue
 
                 #  取该变量
-                var_data = arr[var_idx]  # (T, H, W)
+                var_data = _sanitize_array(arr[var_idx])  # (T, H, W)
 
                 #  取对应 climate
-                climate = np.array(self.climate["cmip6_mean"][var_key])
+                climate = _sanitize_array(np.array(self.climate["cmip6_mean"][var_key]))
 
                 time_steps = var_data.shape[0]
                 month_idx = np.arange(time_steps) % MONTHS_PER_YEAR
                 climate_selected = np.take(climate, month_idx, axis=0)
 
-                anomaly = var_data - climate_selected
+                anomaly = _sanitize_array(var_data - climate_selected)
 
                 all_data[var_key].append(anomaly)
 
@@ -464,13 +528,20 @@ class TrainDataset(BaseDataset):
             print(f"Processing {var_key}...")
 
             # 拼接成一个大数组
-            combined = np.concatenate(data_list, axis=0)  # (total_T, H, W)
+            combined = _sanitize_array(np.concatenate(data_list, axis=0))  # (total_T, H, W)
 
             mean = np.nanmean(combined)
             std = np.nanstd(combined)
+            if not np.isfinite(mean):
+                mean = 0.0
+            if not np.isfinite(std) or std <= EPSILON:
+                std = 1.0
 
             normalized = (combined - mean) / (std + EPSILON)
+            normalized = _sanitize_array(normalized)
             max_val = np.nanmax(np.abs(normalized))
+            if not np.isfinite(max_val) or max_val <= EPSILON:
+                max_val = 1.0
 
             normalize["cmip6_mean"][var_key] = {
                 "mean": float(mean),
@@ -508,22 +579,29 @@ class TrainDataset(BaseDataset):
                 continue
             
             # 计算异常值
-            climate = np.array(self.climate[dataset_name][var_key])
+            climate = _sanitize_array(np.array(self.climate[dataset_name][var_key]))
             time_steps = arr.shape[1]
             month_indices = np.arange(time_steps) % MONTHS_PER_YEAR
             climate_selected = np.take(climate, month_indices, axis=0)
-            anomaly = arr[var_idx] - climate_selected
+            anomaly = _sanitize_array(arr[var_idx] - climate_selected)
             
             # 计算标准化后的值
             anomaly_mean = np.nanmean(anomaly)
             anomaly_std = np.nanstd(anomaly)
-            normalized = (anomaly - anomaly_mean) / anomaly_std
+            if not np.isfinite(anomaly_mean):
+                anomaly_mean = 0.0
+            if not np.isfinite(anomaly_std) or anomaly_std <= EPSILON:
+                anomaly_std = 1.0
+            normalized = _sanitize_array((anomaly - anomaly_mean) / anomaly_std)
+            max_val = np.nanmax(np.abs(normalized))
+            if not np.isfinite(max_val) or max_val <= EPSILON:
+                max_val = 1.0
             
             # 保存参数
             normalize_params[var_key] = {
                 "mean": float(anomaly_mean),
                 "std": float(anomaly_std),
-                "max": float(np.nanmax(np.abs(normalized)))
+                "max": float(max_val)
             }
         
         return normalize_params
@@ -532,7 +610,7 @@ class TrainDataset(BaseDataset):
         """计算数据集大小（窗口数和数据集数量）。"""
         # 找到所有数据集中最短的时间长度
         self.min_time = min(
-            np.load(path, mmap_mode='r').shape[1]
+            self._validate_array_channels(path)
             for path in self.dataset_files
         )
         self.num_windows = max(0, self.min_time - self.window_size + 1)
@@ -594,8 +672,8 @@ class ValDataset(BaseDataset):
         # 计算时间窗口
         # ---------------------------
         self.min_time = min(
-            np.load(p, mmap_mode='r').shape[1]
-            for p in self.dataset_files
+            self._validate_array_channels(path)
+            for path in self.dataset_files
         )
 
         self.num_windows = max(0, self.min_time - self.window_size + 1)

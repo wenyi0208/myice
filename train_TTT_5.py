@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 
 import argparse
+import os
 from pathlib import Path
 from datetime import datetime
+
+os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
 
 import torch
 import torch.optim as optim
@@ -14,7 +17,8 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 from torch.utils.tensorboard import SummaryWriter
 
-from model_geo_TTT_5 import model as create_model
+from dataset import SAMPLE_CHANNELS, ZG_LEVELS
+from model_grouped import MODEL_ARCHITECTURE, model as create_model
 from utils import train_and_eval_one_epoch, get_dataloader, get_val_dataloader
 
 
@@ -22,8 +26,8 @@ def main():
     parser = argparse.ArgumentParser(description='Swin Transformer Training')
     
     # 模型参数
-    parser.add_argument('--in-chans', type=int, default=9,
-                        help='输入通道数 (默认: 9)')
+    parser.add_argument('--in-chans', type=int, default=SAMPLE_CHANNELS,
+                        help=f'输入通道数 (默认: {SAMPLE_CHANNELS})')
     parser.add_argument('--pretrained', type=str, default=None,
                         help='预训练模型路径，加载后默认冻结其他层')
     parser.add_argument('--train-only', type=str, default=None,
@@ -58,12 +62,20 @@ def main():
     parser.add_argument('--log-dir', type=str,
                         default='./runs',
                         help='TensorBoard 日志目录')
+    parser.add_argument('--num-workers', type=int, default=0,
+                        help='DataLoader worker 数量')
     
     args = parser.parse_args()
     
     # 设置设备
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    if args.device == 'cuda' and not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA was requested but no GPU is visible. "
+            "Check Slurm --gres, partition, CUDA_VISIBLE_DEVICES, and nvidia-smi."
+        )
+    device = torch.device(args.device)
     print(f"使用设备: {device}")
+    print("zg 输入层（hPa 文件名/通道顺序）: " + ", ".join(f"zg_{level}.nc" for level in ZG_LEVELS))
     
     # 创建输出目录
     output_dir = Path(args.output_dir)
@@ -79,20 +91,31 @@ def main():
     train_loader = get_dataloader(
         data_dir=args.train_data_dir,
         batch_size=args.batch_size,
-        shuffle=True
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == 'cuda'),
     )
     
     print(f"加载验证数据: {args.val_data_dir}")
     val_loader = get_val_dataloader(
         val_data_dir=args.val_data_dir,
         batch_size=args.batch_size,
-        shuffle=False
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == 'cuda'),
     )
     
     # 打印数据集信息
     train_dataset = train_loader.dataset
     print(f"训练集样本数: {len(train_dataset)}")
     print(f"每轮 batch 数: {len(train_loader)}")
+    expected_in_chans = SAMPLE_CHANNELS
+    if args.in_chans != expected_in_chans:
+        print(
+            f"警告: --in-chans={args.in_chans} 与数据集输入通道数 "
+            f"{expected_in_chans} 不一致，自动改为 {expected_in_chans}。"
+        )
+        args.in_chans = expected_in_chans
     
     # 创建模型
     print(f"创建模型 (in_chans={args.in_chans})")
@@ -105,9 +128,18 @@ def main():
         pretrained_dict = checkpoint.get('model_state_dict', checkpoint)
         
         model_dict = model.state_dict()
-        # 过滤：只加载形状匹配的权重
-        filtered_dict = {k: v for k, v in pretrained_dict.items() 
-                        if k in model_dict and model_dict[k].shape == v.shape}
+        # 兼容旧 TTT-5 模型：其共享 Swin 主干没有 ``backbone.`` 前缀。
+        remapped_dict = {}
+        for key, value in pretrained_dict.items():
+            target_key = key
+            if target_key not in model_dict and f"backbone.{key}" in model_dict:
+                target_key = f"backbone.{key}"
+            remapped_dict[target_key] = value
+        # 只加载形状匹配的权重；新的分组编码器保持随机初始化。
+        filtered_dict = {
+            key: value for key, value in remapped_dict.items()
+            if key in model_dict and model_dict[key].shape == value.shape
+        }
         
         model_dict.update(filtered_dict)
         model.load_state_dict(model_dict)
@@ -193,6 +225,7 @@ def main():
             save_path = output_dir / 'best_model.pth'
             torch.save({
                 'epoch': epoch,
+                'architecture': MODEL_ARCHITECTURE,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'train_loss': train_loss,
@@ -207,6 +240,7 @@ def main():
     save_path = output_dir / 'final_model.pth'
     torch.save({
         'epoch': args.epochs,
+        'architecture': MODEL_ARCHITECTURE,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'best_val_loss': best_val_loss,
